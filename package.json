@@ -1,0 +1,27 @@
+{
+  "name": "wechat-acp-manager",
+  "version": "0.1.0",
+  "description": "Minimal WeChat to ACP manager with workspace routing and shared memory",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "wechat-acp-manager": "./dist/bin/wechat-acp-manager.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --disable-warning=ExperimentalWarning --import tsx/esm src/bin/wechat-acp-manager.ts",
+    "start": "node --disable-warning=ExperimentalWarning dist/bin/wechat-acp-manager.js"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.16.1",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "tsx": "^4.22.3",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

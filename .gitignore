@@ -1,0 +1,28 @@
+node_modules/
+dist/
+coverage/
+
+# Local runtime state
+.wechat-acp-manager/
+logs/
+*.log
+*.pid
+*.db
+*.db-*
+token.json
+sync-buffer.json
+
+# Local env and temp files
+.env
+.env.*
+.tmp-*/
+*.tmp
+
+# TypeScript
+*.tsbuildinfo
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
