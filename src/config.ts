@@ -119,7 +119,8 @@ MVP commands inside chat/local stdin:
   /workspace current
   /workspace stop <id>
   /memory remember <text>
-  /memory search <query>
+  /memory search [--all] <query>
+  /memory topics [--all]
   /cancel
   /exit                            Exit local mode
 

@@ -4,6 +4,26 @@ import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { newId, nowIso } from "../util/ids.js";
 
 export type MemoryScope = "global" | "user" | "workspace" | "session";
+export type MemoryTopicId =
+  | "user-preferences"
+  | "project-conventions"
+  | "architecture"
+  | "workflows"
+  | "commands"
+  | "decisions"
+  | "issues"
+  | "dependencies"
+  | "external-research"
+  | "sessions"
+  | "general";
+
+export interface MemoryTopic {
+  id: MemoryTopicId;
+  label: string;
+  description: string;
+  count: number;
+  sampleMemoryIds: string[];
+}
 
 export interface WorkspaceRecord {
   id: string;
@@ -30,6 +50,7 @@ export interface MemoryRecord {
 export interface ContextBundle {
   workspace?: WorkspaceRecord;
   sessionSummary?: string;
+  memoryTopics: MemoryTopic[];
   memories: MemoryRecord[];
 }
 
@@ -52,7 +73,7 @@ interface RememberInput {
 export class MemoryStore {
   private readonly db: DatabaseSync;
 
-  constructor(databasePath: string) {
+  constructor(readonly databasePath: string) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true });
     this.db = new DatabaseSync(databasePath);
     this.initialize();
@@ -162,6 +183,8 @@ export class MemoryStore {
   remember(input: RememberInput): MemoryRecord {
     const id = newId("mem");
     const timestamp = nowIso();
+    const topics = inferMemoryTopics({ content: input.content, tags: input.tags ?? [], scope: input.scope });
+    const tags = normalizeTags([...(input.tags ?? []), ...topics.map((topic) => `topic:${topic}`)]);
     this.db
       .prepare(
         `INSERT INTO memories
@@ -174,7 +197,7 @@ export class MemoryStore {
         input.workspaceId ?? null,
         input.userId ?? null,
         input.content,
-        JSON.stringify(input.tags ?? []),
+        JSON.stringify(tags),
         input.sourceTurnId ?? null,
         timestamp,
         timestamp,
@@ -187,30 +210,39 @@ export class MemoryStore {
     userId?: string;
     workspaceId?: string;
     scope?: MemoryScope;
+    includeAllWorkspaces?: boolean;
     limit?: number;
   }): MemoryRecord[] {
     const query = params.query.trim();
     if (!query) return [];
 
-    const like = `%${query}%`;
+    const terms = tokenize(query);
+    const textClauses = terms.length > 0
+      ? terms.map(() => "(content LIKE ? OR tags LIKE ?)").join(" OR ")
+      : "(content LIKE ? OR tags LIKE ?)";
     const where = [
-      "(content LIKE ? OR tags LIKE ?)",
-      "(scope = 'global' OR (scope = 'user' AND user_id = ?) OR (scope = 'workspace' AND workspace_id = ?) OR (scope = 'session' AND workspace_id = ?))",
+      textClauses,
+      params.includeAllWorkspaces
+        ? "(scope = 'global' OR (scope = 'user' AND user_id = ?) OR scope = 'workspace' OR scope = 'session')"
+        : "(scope = 'global' OR (scope = 'user' AND user_id = ?) OR (scope = 'workspace' AND workspace_id = ?) OR (scope = 'session' AND workspace_id = ?))",
     ];
-    const values: Array<string | number | null> = [
-      like,
-      like,
-      params.userId ?? null,
-      params.workspaceId ?? null,
-      params.workspaceId ?? null,
-    ];
+    const values: Array<string | number | null> = [];
+    for (const term of terms.length > 0 ? terms : [query]) {
+      const like = `%${term}%`;
+      values.push(like, like);
+    }
+    values.push(params.userId ?? null);
+    if (!params.includeAllWorkspaces) {
+      values.push(params.workspaceId ?? null, params.workspaceId ?? null);
+    }
 
     if (params.scope) {
       where.push("scope = ?");
       values.push(params.scope);
     }
 
-    values.push(params.limit ?? 8);
+    const fetchLimit = Math.max((params.limit ?? 8) * 4, 24);
+    values.push(fetchLimit);
 
     const rows = this.db
       .prepare(
@@ -222,26 +254,95 @@ export class MemoryStore {
       )
       .all(...values);
 
-    return rows.map(mapMemory);
+    return rows
+      .map(mapMemory)
+      .sort((left, right) => scoreMemory(right, query, terms, params.workspaceId) - scoreMemory(left, query, terms, params.workspaceId))
+      .slice(0, params.limit ?? 8);
   }
 
-  getContext(params: { workspaceId: string; userId: string; query: string; limit?: number }): ContextBundle {
+  getContext(params: {
+    workspaceId: string;
+    userId: string;
+    query: string;
+    includeAllWorkspaces?: boolean;
+    limit?: number;
+  }): ContextBundle {
     const workspace = this.getWorkspace(params.workspaceId);
     return {
       workspace,
       sessionSummary: this.getSessionSummary(params.workspaceId),
+      memoryTopics: this.getMemoryTopics({
+        workspaceId: params.workspaceId,
+        userId: params.userId,
+        includeAllWorkspaces: params.includeAllWorkspaces,
+        limit: 8,
+      }),
       memories: this.searchMemories({
         query: params.query,
         workspaceId: params.workspaceId,
         userId: params.userId,
+        includeAllWorkspaces: params.includeAllWorkspaces,
         limit: params.limit ?? 8,
       }),
     };
   }
 
-  private getMemory(id: string): MemoryRecord | undefined {
+  getMemory(id: string): MemoryRecord | undefined {
     const row = this.db.prepare("SELECT * FROM memories WHERE id = ?").get(id);
     return row ? mapMemory(row) : undefined;
+  }
+
+  getMemoryTopics(params: {
+    userId?: string;
+    workspaceId?: string;
+    includeAllWorkspaces?: boolean;
+    limit?: number;
+  }): MemoryTopic[] {
+    const where = params.includeAllWorkspaces
+      ? "(scope = 'global' OR (scope = 'user' AND user_id = ?) OR scope = 'workspace' OR scope = 'session')"
+      : "(scope = 'global' OR (scope = 'user' AND user_id = ?) OR (scope = 'workspace' AND workspace_id = ?) OR (scope = 'session' AND workspace_id = ?))";
+    const values: Array<string | number | null> = [params.userId ?? null];
+    if (!params.includeAllWorkspaces) {
+      values.push(params.workspaceId ?? null, params.workspaceId ?? null);
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM memories
+         WHERE ${where}
+         ORDER BY updated_at DESC
+         LIMIT ?`,
+      )
+      .all(...values, 500)
+      .map(mapMemory);
+
+    const byTopic = new Map<MemoryTopicId, { count: number; sampleMemoryIds: string[] }>();
+    for (const memory of rows) {
+      for (const topic of inferMemoryTopics(memory)) {
+        const current = byTopic.get(topic) ?? { count: 0, sampleMemoryIds: [] };
+        current.count += 1;
+        if (current.sampleMemoryIds.length < 3) {
+          current.sampleMemoryIds.push(memory.id);
+        }
+        byTopic.set(topic, current);
+      }
+    }
+
+    return MEMORY_TOPIC_DEFINITIONS
+      .map((definition) => {
+        const aggregate = byTopic.get(definition.id);
+        return aggregate
+          ? {
+              ...definition,
+              count: aggregate.count,
+              sampleMemoryIds: aggregate.sampleMemoryIds,
+            }
+          : undefined;
+      })
+      .filter((topic): topic is MemoryTopic => !!topic)
+      .sort((left, right) => right.count - left.count)
+      .slice(0, params.limit ?? 8);
   }
 
   private initialize(): void {
@@ -296,6 +397,64 @@ export class MemoryStore {
 }
 
 type SqlRow = Record<string, SQLOutputValue>;
+
+const MEMORY_TOPIC_DEFINITIONS: Array<Omit<MemoryTopic, "count" | "sampleMemoryIds">> = [
+  {
+    id: "user-preferences",
+    label: "User preferences",
+    description: "Durable user preferences, personal workflow habits, and communication style.",
+  },
+  {
+    id: "project-conventions",
+    label: "Project conventions",
+    description: "Repository-specific coding standards, test practices, naming, and review rules.",
+  },
+  {
+    id: "architecture",
+    label: "Architecture",
+    description: "System structure, component responsibilities, protocols, and data flow.",
+  },
+  {
+    id: "workflows",
+    label: "Workflows",
+    description: "Operational steps for development, release, setup, deployment, and routine tasks.",
+  },
+  {
+    id: "commands",
+    label: "Commands",
+    description: "Verified commands, CLIs, scripts, flags, and local setup invocations.",
+  },
+  {
+    id: "decisions",
+    label: "Decisions",
+    description: "Past design decisions, tradeoffs, constraints, and rationale.",
+  },
+  {
+    id: "issues",
+    label: "Issues",
+    description: "Known bugs, risks, failures, blockers, and debugging findings.",
+  },
+  {
+    id: "dependencies",
+    label: "Dependencies",
+    description: "Packages, tools, runtime versions, SDKs, and external services.",
+  },
+  {
+    id: "external-research",
+    label: "External research",
+    description: "Distilled findings from web, social, OpenCLI, or other external source research.",
+  },
+  {
+    id: "sessions",
+    label: "Sessions",
+    description: "Session summaries, previous conversations, and historical task context.",
+  },
+  {
+    id: "general",
+    label: "General",
+    description: "Memory that does not fit a more specific topic.",
+  },
+];
 
 function mapWorkspace(row: SqlRow): WorkspaceRecord {
   return {
@@ -368,4 +527,86 @@ function readScope(row: SqlRow, key: string): MemoryScope {
     return value;
   }
   throw new Error(`Unexpected memory scope: ${value}`);
+}
+
+function tokenize(query: string): string[] {
+  const matches = query
+    .toLocaleLowerCase()
+    .match(/[\p{L}\p{N}_-]+/gu) ?? [];
+  return [...new Set(matches)].slice(0, 12);
+}
+
+function scoreMemory(memory: MemoryRecord, query: string, terms: string[], workspaceId: string | undefined): number {
+  const haystack = `${memory.content}\n${memory.tags.join(" ")}`.toLocaleLowerCase();
+  let score = haystack.includes(query.toLocaleLowerCase()) ? 10 : 0;
+  for (const term of terms) {
+    if (haystack.includes(term)) {
+      score += term.length > 1 ? 3 : 1;
+    }
+  }
+  if (workspaceId && memory.workspaceId === workspaceId) {
+    score += 2;
+  }
+  if (memory.scope === "user" || memory.scope === "global") {
+    score += 1;
+  }
+  return score;
+}
+
+function inferMemoryTopics(memory: Pick<MemoryRecord, "content" | "tags" | "scope">): MemoryTopicId[] {
+  const text = `${memory.content}\n${memory.tags.join(" ")}`.toLocaleLowerCase();
+  const topics = new Set<MemoryTopicId>();
+
+  for (const tag of memory.tags) {
+    if (tag.startsWith("topic:")) {
+      const topic = tag.slice("topic:".length);
+      if (isMemoryTopicId(topic)) topics.add(topic);
+    }
+  }
+
+  if (memory.scope === "user" || matchesAny(text, ["preference", "prefer", "habit", "style", "偏好", "习惯", "风格"])) {
+    topics.add("user-preferences");
+  }
+  if (matchesAny(text, ["convention", "standard", "lint", "test", "review", "naming", "约定", "规范", "测试", "命名"])) {
+    topics.add("project-conventions");
+  }
+  if (matchesAny(text, ["architecture", "component", "protocol", "data flow", "mcp", "acp", "架构", "组件", "协议", "数据流"])) {
+    topics.add("architecture");
+  }
+  if (matchesAny(text, ["workflow", "release", "publish", "deploy", "setup", "login", "流程", "发布", "部署", "登录"])) {
+    topics.add("workflows");
+  }
+  if (matchesAny(text, ["command", "npm ", "npx ", "git ", "wsl ", "python ", "node ", "命令", "脚本"])) {
+    topics.add("commands");
+  }
+  if (matchesAny(text, ["decision", "tradeoff", "rationale", "decided", "选择", "决定", "权衡", "原因"])) {
+    topics.add("decisions");
+  }
+  if (matchesAny(text, ["bug", "issue", "risk", "error", "failed", "blocker", "问题", "风险", "失败", "报错"])) {
+    topics.add("issues");
+  }
+  if (matchesAny(text, ["dependency", "package", "sdk", "version", "runtime", "依赖", "包", "版本"])) {
+    topics.add("dependencies");
+  }
+  if (matchesAny(text, ["external-research", "opencli", "xiaohongshu", "twitter", "reddit", "web research", "调研", "小红书"])) {
+    topics.add("external-research");
+  }
+  if (memory.scope === "session" || matchesAny(text, ["session", "transcript", "summary", "history", "会话", "历史", "摘要"])) {
+    topics.add("sessions");
+  }
+
+  if (topics.size === 0) topics.add("general");
+  return [...topics];
+}
+
+function isMemoryTopicId(value: string): value is MemoryTopicId {
+  return MEMORY_TOPIC_DEFINITIONS.some((topic) => topic.id === value);
+}
+
+function matchesAny(text: string, needles: string[]): boolean {
+  return needles.some((needle) => text.includes(needle));
+}
+
+function normalizeTags(tags: string[]): string[] {
+  return [...new Set(tags.map((tag) => tag.trim()).filter(Boolean))].slice(0, 24);
 }

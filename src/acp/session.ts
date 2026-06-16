@@ -9,6 +9,7 @@ export interface AcpSessionOptions {
   workspaceId: string;
   preset: AgentPreset;
   cwd: string;
+  mcpServers?: acp.McpServer[];
   log: Logger;
   onTyping?: () => Promise<void>;
   onExit?: (code: number | null, signal: NodeJS.Signals | null) => void;
@@ -85,7 +86,7 @@ export class AcpSession {
 
     const newSessionResult = await connection.newSession({
       cwd,
-      mcpServers: [],
+      mcpServers: this.options.mcpServers ?? [],
     });
     log(`[workspace:${this.options.workspaceId}] ACP session created: ${newSessionResult.sessionId}`);
 

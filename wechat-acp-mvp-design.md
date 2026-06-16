@@ -129,10 +129,28 @@ MVP 建议先保留少量命令：
 | `/workspace stop <id>` | 停止某个 workspace |
 | `/workspace current` | 查看当前 active workspace |
 | `/cancel` | 取消当前 in-flight ACP turn |
-| `/memory search <query>` | 搜索 memory |
+| `/memory search <query>` | 搜索当前可见 memory |
+| `/memory search --all <query>` | 跨 workspace 搜索 memory |
+| `/memory topics [--all]` | 查看固定 memory 主题索引 |
 | `/memory remember <text>` | 显式写入长期 memory |
 
 可以暂时不做 `/acp-config`，因为它依赖 agent 的 `configOptions`，不是 MVP 主链路。
+
+外部能力通过 `pluginmarket` 挂载：manager 默认扫描启动目录上级的 `pluginmarket/*/plugin.json`，也可以用 `WECHAT_ACP_PLUGIN_DIR` 指定插件目录。每个插件可以同时提供：
+
+| 插件能力 | 作用 |
+|---|---|
+| stdio MCP server | 作为 ACP `mcpServers` 自动挂到每个新 session 上 |
+| `SKILL.md` | 注入 prompt 的 `[Plugin Skills]`，告诉 agent 何时、如何组合 MCP tools |
+
+Memory 现在以 `pluginmarket/memory-mcp` 形式作为 stdio MCP server 自动挂到每个 ACP session 上。Agent 可在需要历史资料时调用：
+
+| MCP tool | 作用 |
+|---|---|
+| `memory_search` | 按 query 检索 user/global/workspace/session memory，可启用跨 workspace 检索 |
+| `memory_get` | 按 id 读取某条 memory |
+| `memory_topics` | 列出固定 memory 主题、计数和样例 id，帮助 agent 在检索前选择上下文 |
+| `memory_remember` | 写入稳定事实、用户偏好或 workspace 约定 |
 
 ## 消息处理流程
 
@@ -145,9 +163,11 @@ MVP 建议先保留少量命令：
   -> 如果不是命令：
       -> 获取 active workspace
       -> 加入该用户 turn queue
-      -> 从 memory service 获取相关上下文
+      -> 从 memory service 生成固定主题索引
+      -> 从 memory service 自动检索相关上下文（默认覆盖当前用户、global、当前 workspace，并可召回其他 workspace）
       -> 组装 prompt
-      -> 发送给 active ACP session
+      -> 发送给 active ACP session（包含插件 skills、主题索引、自动召回 memory 和 MCP 使用提示）
+      -> agent 可先看 Plugin Skills / Memory Topic Index，再按需调用 MCP tools 深挖历史资料
       -> 收集 agent 输出
       -> 回复微信
       -> 保存 transcript

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import type * as acp from "@agentclientprotocol/sdk";
 import { AGENT_PRESETS, type AgentPreset } from "../config.js";
 import { AcpSession } from "../acp/session.js";
 import type { Logger } from "../logger.js";
@@ -12,6 +13,21 @@ interface RunningWorkspace {
   record: WorkspaceRecord;
   preset: AgentPreset;
   session: AcpSession;
+}
+
+interface PluginManifest {
+  name: string;
+  description?: string;
+  skill?: string;
+  transport?: "stdio";
+  command: string;
+  args?: string[];
+  env?: Array<{ name: string; value: string }>;
+}
+
+interface PluginSkill {
+  name: string;
+  content: string;
 }
 
 export class WorkspaceManager {
@@ -65,7 +81,7 @@ export class WorkspaceManager {
 
     switch (command) {
       case "/workspace":
-        return this.handleWorkspaceCommand(args);
+        return this.handleWorkspaceCommand(args, userId);
       case "/memory":
         return this.handleMemoryCommand(args, userId);
       case "/cancel":
@@ -77,13 +93,13 @@ export class WorkspaceManager {
     }
   }
 
-  private async handleWorkspaceCommand(args: string[]): Promise<string> {
+  private async handleWorkspaceCommand(args: string[], userId: string): Promise<string> {
     const subcommand = args[0];
     switch (subcommand) {
       case "open":
-        return this.openWorkspace(args);
+        return this.openWorkspace(args, userId);
       case "use":
-        return this.useWorkspace(args[1]);
+        return this.useWorkspace(args[1], userId);
       case "list":
         return this.listWorkspaces();
       case "current":
@@ -95,7 +111,7 @@ export class WorkspaceManager {
     }
   }
 
-  private async openWorkspace(args: string[]): Promise<string> {
+  private async openWorkspace(args: string[], userId: string): Promise<string> {
     const id = args[1];
     const agent = args[2] as AgentKind | undefined;
     const cwdText = args.slice(3).join(" ");
@@ -123,6 +139,7 @@ export class WorkspaceManager {
       workspaceId: id,
       preset,
       cwd,
+      mcpServers: createSessionMcpServers(this.store.databasePath, userId, id),
       log: this.log,
       onExit: () => {
         this.running.delete(id);
@@ -155,7 +172,7 @@ export class WorkspaceManager {
     return `Workspace '${id}' is running with ${preset.label} at ${cwd}. It is now active.`;
   }
 
-  private async useWorkspace(id: string | undefined): Promise<string> {
+  private async useWorkspace(id: string | undefined, userId: string): Promise<string> {
     if (!id) {
       return "Usage: /workspace use <id>";
     }
@@ -170,7 +187,7 @@ export class WorkspaceManager {
       if (!preset) {
         return `Workspace '${id}' uses unsupported agent '${record.agent}'.`;
       }
-      running = await this.startFromRecord(record, preset);
+      running = await this.startFromRecord(record, preset, userId);
     }
 
     this.activeWorkspaceId = running.record.id;
@@ -238,19 +255,36 @@ export class WorkspaceManager {
         return `Remembered (${memory.scope}): ${memory.content}`;
       }
       case "search": {
-        const query = args.slice(1).join(" ").trim();
-        if (!query) return "Usage: /memory search <query>";
+        const includeAllWorkspaces = args[1] === "--all";
+        const query = args.slice(includeAllWorkspaces ? 2 : 1).join(" ").trim();
+        if (!query) return "Usage: /memory search [--all] <query>";
         const results = this.store.searchMemories({
           query,
           userId,
           workspaceId: this.activeWorkspaceId,
+          includeAllWorkspaces,
           limit: 8,
         });
         if (results.length === 0) return "No matching memory.";
-        return results.map((memory) => `- [${memory.scope}] ${memory.content}`).join("\n");
+        return results
+          .map((memory) => `- ${memory.id} [${memory.scope}${memory.workspaceId ? `:${memory.workspaceId}` : ""}] ${memory.content}`)
+          .join("\n");
+      }
+      case "topics": {
+        const includeAllWorkspaces = args[1] === "--all";
+        const topics = this.store.getMemoryTopics({
+          userId,
+          workspaceId: this.activeWorkspaceId,
+          includeAllWorkspaces,
+          limit: 10,
+        });
+        if (topics.length === 0) return "No memory topics yet.";
+        return topics
+          .map((topic) => `- ${topic.id} (${topic.count}) ${topic.description} examples: ${topic.sampleMemoryIds.join(", ")}`)
+          .join("\n");
       }
       default:
-        return "Usage: /memory remember <text> | search <query>";
+        return "Usage: /memory remember <text> | search [--all] <query> | topics [--all]";
     }
   }
 
@@ -271,7 +305,8 @@ export class WorkspaceManager {
       "/workspace current",
       "/workspace stop <id>",
       "/memory remember <text>",
-      "/memory search <query>",
+      "/memory search [--all] <query>",
+      "/memory topics [--all]",
       "/cancel",
     ].join("\n");
   }
@@ -298,6 +333,7 @@ export class WorkspaceManager {
       workspaceId: active.record.id,
       userId: message.userId,
       query: message.text,
+      includeAllWorkspaces: true,
     });
     const recentTurns = this.store.getRecentTurns(active.record.id, message.userId, 8);
     const prompt = buildPrompt(message.text, context, recentTurns);
@@ -325,12 +361,13 @@ export class WorkspaceManager {
     return this.running.get(this.activeWorkspaceId);
   }
 
-  private async startFromRecord(record: WorkspaceRecord, preset: AgentPreset): Promise<RunningWorkspace> {
+  private async startFromRecord(record: WorkspaceRecord, preset: AgentPreset, userId: string): Promise<RunningWorkspace> {
     validateDirectory(record.cwd);
     const session = new AcpSession({
       workspaceId: record.id,
       preset,
       cwd: record.cwd,
+      mcpServers: createSessionMcpServers(this.store.databasePath, userId, record.id),
       log: this.log,
       onExit: () => {
         this.running.delete(record.id);
@@ -381,11 +418,42 @@ function buildPrompt(
     sections.push(`[Session Summary]\n${context.sessionSummary.trim()}`);
   }
 
-  if (context.memories.length > 0) {
+  const pluginSkills = loadPluginSkills();
+  if (pluginSkills.length > 0) {
     sections.push(
-      `[Relevant Memories]\n${context.memories.map((memory) => `- [${memory.scope}] ${memory.content}`).join("\n")}`,
+      `[Plugin Skills]\n${pluginSkills
+        .map((skill) => `## ${skill.name}\n${truncate(skill.content, 4_000)}`)
+        .join("\n\n")}`,
     );
   }
+
+  if (context.memoryTopics.length > 0) {
+    sections.push(
+      `[Memory Topic Index]\n${context.memoryTopics
+        .map(
+          (topic) =>
+            `- ${topic.id} (${topic.count} memories): ${topic.description} sample ids: ${topic.sampleMemoryIds.join(", ")}`,
+        )
+        .join("\n")}`,
+    );
+  }
+
+  if (context.memories.length > 0) {
+    sections.push(
+      `[Relevant Memories]\n${context.memories
+        .map((memory) => `- ${memory.id} [${memory.scope}${memory.workspaceId ? `:${memory.workspaceId}` : ""}] ${memory.content}`)
+        .join("\n")}`,
+    );
+  }
+
+  sections.push(
+    [
+      "[Memory Access]",
+      "Before answering, inspect the Memory Topic Index to decide which durable context may be relevant.",
+      "Relevant memories above were auto-retrieved across user/global/current workspace and other workspaces.",
+      "If a topic looks relevant but details are missing, use MCP tools memory_topics, memory_search, memory_get, and memory_remember.",
+    ].join("\n"),
+  );
 
   if (recentTurns.length > 0) {
     sections.push(
@@ -413,4 +481,111 @@ function validateDirectory(cwd: string): void {
 
 function truncate(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.substring(0, maxLength)}...`;
+}
+
+function createSessionMcpServers(databasePath: string, userId: string, workspaceId: string): acp.McpServer[] {
+  return loadPluginMcpServers({
+    WECHAT_ACP_MEMORY_DB: databasePath,
+    WECHAT_ACP_USER_ID: userId,
+    WECHAT_ACP_WORKSPACE_ID: workspaceId,
+  });
+}
+
+function loadPluginMcpServers(sessionEnv: Record<string, string>): acp.McpServer[] {
+  const pluginRoot = path.resolve(process.env.WECHAT_ACP_PLUGIN_DIR ?? path.join(process.cwd(), "..", "pluginmarket"));
+  if (!fs.existsSync(pluginRoot) || !fs.statSync(pluginRoot).isDirectory()) {
+    return [];
+  }
+
+  const servers: acp.McpServer[] = [];
+  for (const entry of fs.readdirSync(pluginRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const pluginDir = path.join(pluginRoot, entry.name);
+    const manifestPath = path.join(pluginDir, "plugin.json");
+    if (!fs.existsSync(manifestPath)) continue;
+
+    const manifest = readPluginManifest(manifestPath);
+    if (!manifest) continue;
+    servers.push({
+      name: manifest.name,
+      command: manifest.command,
+      args: resolvePluginArgs(pluginDir, manifest.args ?? []),
+      env: resolvePluginEnv(manifest.env ?? [], sessionEnv),
+    });
+  }
+  return servers;
+}
+
+function readPluginManifest(manifestPath: string): PluginManifest | undefined {
+  const parsed: unknown = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const manifest = parsed as Partial<PluginManifest>;
+  if (manifest.transport && manifest.transport !== "stdio") return undefined;
+  if (typeof manifest.name !== "string" || typeof manifest.command !== "string") return undefined;
+  if (manifest.args && !Array.isArray(manifest.args)) return undefined;
+  if (manifest.env && !Array.isArray(manifest.env)) return undefined;
+  return {
+    name: manifest.name,
+    description: typeof manifest.description === "string" ? manifest.description : undefined,
+    skill: typeof manifest.skill === "string" ? manifest.skill : undefined,
+    transport: manifest.transport,
+    command: manifest.command,
+    args: manifest.args?.filter((arg): arg is string => typeof arg === "string"),
+    env: manifest.env?.filter(
+      (item): item is { name: string; value: string } =>
+        !!item && typeof item === "object" && typeof item.name === "string" && typeof item.value === "string",
+    ),
+  };
+}
+
+function resolvePluginArgs(pluginDir: string, args: string[]): string[] {
+  return args.map((arg) => {
+    if (arg.startsWith("-") || path.isAbsolute(arg)) return arg;
+    if (!arg.includes("/") && !arg.includes("\\")) return arg;
+    const absolute = path.resolve(pluginDir, arg);
+    return fs.existsSync(absolute) ? absolute : arg;
+  });
+}
+
+function resolvePluginEnv(
+  env: Array<{ name: string; value: string }>,
+  sessionEnv: Record<string, string>,
+): Array<{ name: string; value: string }> {
+  return env.map((item) => ({
+    name: item.name,
+    value: item.value.replace(/\$\{([A-Z0-9_]+)\}/g, (_match, key: string) => sessionEnv[key] ?? ""),
+  }));
+}
+
+function loadPluginSkills(): PluginSkill[] {
+  const pluginRoot = path.resolve(process.env.WECHAT_ACP_PLUGIN_DIR ?? path.join(process.cwd(), "..", "pluginmarket"));
+  if (!fs.existsSync(pluginRoot) || !fs.statSync(pluginRoot).isDirectory()) {
+    return [];
+  }
+
+  const skills: PluginSkill[] = [];
+  for (const entry of fs.readdirSync(pluginRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const pluginDir = path.join(pluginRoot, entry.name);
+    const manifestPath = path.join(pluginDir, "plugin.json");
+    if (!fs.existsSync(manifestPath)) continue;
+    const manifest = readPluginManifest(manifestPath);
+    if (!manifest) continue;
+    const skillPath = resolvePluginSkillPath(pluginDir, manifest.skill ?? "SKILL.md");
+    if (!skillPath) continue;
+    skills.push({
+      name: manifest.name,
+      content: fs.readFileSync(skillPath, "utf-8").trim(),
+    });
+  }
+  return skills;
+}
+
+function resolvePluginSkillPath(pluginDir: string, skillPath: string): string | undefined {
+  const pluginRoot = path.resolve(pluginDir);
+  const absolute = path.resolve(pluginRoot, skillPath);
+  if (absolute !== pluginRoot && !absolute.startsWith(`${pluginRoot}${path.sep}`)) {
+    return undefined;
+  }
+  return fs.existsSync(absolute) && fs.statSync(absolute).isFile() ? absolute : undefined;
 }
