@@ -8,7 +8,7 @@
     "wechat-acp-mvp-design.md"
   ],
   "bin": {
-    "wechat-acp-manager": "./dist/bin/wechat-acp-manager.js"
+    "wechat-acp-manager": "dist/bin/wechat-acp-manager.js"
   },
   "scripts": {
     "build": "tsc",
@@ -29,5 +29,13 @@
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yetsmarch-sina/WechatOmini"
+  },
+  "homepage": "https://github.com/yetsmarch-sina/WechatOmini#readme",
+  "bugs": {
+    "url": "https://github.com/yetsmarch-sina/WechatOmini/issues"
   }
 }
