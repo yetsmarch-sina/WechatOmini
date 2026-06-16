@@ -19,6 +19,8 @@ export class AcpSession {
   private connection?: acp.ClientSideConnection;
   private sessionId?: string;
   private client?: AcpClient;
+  private exited = false;
+  private killTimer?: ReturnType<typeof setTimeout>;
 
   constructor(private readonly options: AcpSessionOptions) {}
 
@@ -39,11 +41,17 @@ export class AcpSession {
       stdio: ["pipe", "pipe", "inherit"],
       windowsHide: true,
     });
+    this.exited = false;
 
     child.on("error", (error) => {
       log(`[workspace:${this.options.workspaceId}] agent process error: ${String(error)}`);
     });
     child.on("exit", (code, signal) => {
+      this.exited = true;
+      if (this.killTimer) {
+        clearTimeout(this.killTimer);
+        this.killTimer = undefined;
+      }
       log(`[workspace:${this.options.workspaceId}] agent exited: code=${code} signal=${signal}`);
       this.options.onExit?.(code, signal);
     });
@@ -119,11 +127,11 @@ export class AcpSession {
   }
 
   stop(): void {
-    if (!this.process || this.process.killed) return;
-    this.process.kill("SIGTERM");
+    if (!this.process || this.exited) return;
     const child = this.process;
-    setTimeout(() => {
-      if (!child.killed) {
+    child.kill("SIGTERM");
+    this.killTimer = setTimeout(() => {
+      if (!this.exited) {
         child.kill("SIGKILL");
       }
     }, 5_000).unref();
