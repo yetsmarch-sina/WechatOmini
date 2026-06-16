@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "description": "Minimal WeChat to ACP manager with workspace routing and shared memory",
   "type": "module",
-  "private": true,
+  "files": [
+    "dist/",
+    "wechat-acp-mvp-design.md"
+  ],
   "bin": {
     "wechat-acp-manager": "./dist/bin/wechat-acp-manager.js"
   },
@@ -23,5 +26,8 @@
   },
   "engines": {
     "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
   }
 }
