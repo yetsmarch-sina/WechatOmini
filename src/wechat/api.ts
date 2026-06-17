@@ -3,6 +3,16 @@ import { MessageState, MessageType, type GetUpdatesResponse, type WeChatMessage 
 
 const CHANNEL_VERSION = "1.0.2";
 
+export class WeChatApiTimeoutError extends Error {
+  constructor(
+    readonly path: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`WeChat API ${path} timed out after ${timeoutMs}ms`);
+    this.name = "WeChatApiTimeoutError";
+  }
+}
+
 function headers(token?: string): Record<string, string> {
   const result: Record<string, string> = {
     "Content-Type": "application/json",
@@ -45,9 +55,20 @@ async function postJson<T>(
       throw new Error(`WeChat API HTTP ${response.status}: ${text}`);
     }
     return JSON.parse(text) as T;
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw new WeChatApiTimeoutError(path, timeoutMs);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException
+    ? error.name === "AbortError"
+    : error instanceof Error && error.name === "AbortError";
 }
 
 export async function getBotQrCode(params: {

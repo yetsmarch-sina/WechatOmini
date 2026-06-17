@@ -31,6 +31,8 @@ export interface WorkspaceRecord {
   cwd: string;
   status: string;
   pid?: number;
+  resumeId?: string;
+  resumeCommand?: string;
   createdAt: string;
   lastActiveAt: string;
 }
@@ -106,6 +108,12 @@ export class MemoryStore {
       )
       .run(record.id, record.agent, record.cwd, record.status, record.pid ?? null, createdAt, lastActiveAt);
     return this.getWorkspace(record.id)!;
+  }
+
+  updateWorkspaceResumeInfo(id: string, resume: { id: string; command?: string }): void {
+    this.db
+      .prepare("UPDATE workspaces SET resume_id = ?, resume_command = ?, last_active_at = ? WHERE id = ?")
+      .run(resume.id, resume.command ?? null, nowIso(), id);
   }
 
   updateWorkspaceStatus(id: string, status: string, pid?: number): void {
@@ -356,6 +364,8 @@ export class MemoryStore {
         cwd TEXT NOT NULL,
         status TEXT NOT NULL,
         pid INTEGER,
+        resume_id TEXT,
+        resume_command TEXT,
         created_at TEXT NOT NULL,
         last_active_at TEXT NOT NULL
       );
@@ -393,6 +403,14 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_memories_scope_workspace_user
         ON memories(scope, workspace_id, user_id, updated_at);
     `);
+    this.ensureColumn("workspaces", "resume_id", "TEXT");
+    this.ensureColumn("workspaces", "resume_command", "TEXT");
+  }
+
+  private ensureColumn(table: string, column: string, type: string): void {
+    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all();
+    if (rows.some((row) => readString(row, "name") === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
 }
 
@@ -463,6 +481,8 @@ function mapWorkspace(row: SqlRow): WorkspaceRecord {
     cwd: readString(row, "cwd"),
     status: readString(row, "status"),
     pid: readOptionalNumber(row, "pid"),
+    resumeId: readOptionalString(row, "resume_id"),
+    resumeCommand: readOptionalString(row, "resume_command"),
     createdAt: readString(row, "created_at"),
     lastActiveAt: readString(row, "last_active_at"),
   };

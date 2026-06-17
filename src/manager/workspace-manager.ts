@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import { AGENT_PRESETS, type AgentPreset } from "../config.js";
-import { AcpSession } from "../acp/session.js";
+import { AcpSession, type AcpResumeInfo } from "../acp/session.js";
 import type { Logger } from "../logger.js";
 import type { MemoryStore, ContextBundle, WorkspaceRecord } from "../memory/store.js";
 import type { AgentKind, IncomingMessage, MessageTransport, ReplyTarget } from "../types.js";
@@ -30,9 +30,16 @@ interface PluginSkill {
   content: string;
 }
 
+interface PendingWorkspaceCreate {
+  id: string;
+  agent: AgentKind;
+  cwd: string;
+}
+
 export class WorkspaceManager {
   private readonly running = new Map<string, RunningWorkspace>();
   private readonly queues = new Map<string, Promise<void>>();
+  private readonly pendingWorkspaceCreates = new Map<string, PendingWorkspaceCreate>();
   private activeWorkspaceId?: string;
 
   constructor(
@@ -98,6 +105,11 @@ export class WorkspaceManager {
     switch (subcommand) {
       case "open":
         return this.openWorkspace(args, userId);
+      case "confirm-create":
+        return this.confirmWorkspaceCreate(userId);
+      case "cancel-create":
+        this.pendingWorkspaceCreates.delete(userId);
+        return "Cancelled pending workspace directory creation.";
       case "use":
         return this.useWorkspace(args[1], userId);
       case "list":
@@ -107,17 +119,21 @@ export class WorkspaceManager {
       case "stop":
         return this.stopWorkspace(args[1]);
       default:
-        return "Usage: /workspace open <id> <copilot|opencode> <cwd> | use <id> | list | current | stop <id>";
+        return "Usage: /workspace open <id> <copilot|opencode> <cwd> [--create] | confirm-create | cancel-create | use <id> | list | current | stop <id>";
     }
   }
 
   private async openWorkspace(args: string[], userId: string): Promise<string> {
     const id = args[1];
     const agent = args[2] as AgentKind | undefined;
-    const cwdText = args.slice(3).join(" ");
+    const create = args.includes("--create");
+    const cwdText = args
+      .slice(3)
+      .filter((arg) => arg !== "--create")
+      .join(" ");
 
     if (!id || !agent || !cwdText) {
-      return "Usage: /workspace open <id> <copilot|opencode> <cwd>";
+      return "Usage: /workspace open <id> <copilot|opencode> <cwd> [--create]";
     }
     validateWorkspaceId(id);
 
@@ -127,7 +143,43 @@ export class WorkspaceManager {
     }
 
     const cwd = path.resolve(cwdText);
+    if (!fs.existsSync(cwd)) {
+      if (!create) {
+        this.pendingWorkspaceCreates.set(userId, { id, agent, cwd });
+        return [
+          `Directory does not exist: ${cwd}`,
+          "Send `/workspace confirm-create` to create it and start the workspace.",
+          "Or send `/workspace cancel-create` to cancel.",
+          "To skip confirmation next time, use `/workspace open <id> <agent> <cwd> --create`.",
+        ].join("\n");
+      }
+      fs.mkdirSync(cwd, { recursive: true });
+    }
     validateDirectory(cwd);
+
+    return this.startWorkspace({ id, agent, cwd, userId });
+  }
+
+  private async confirmWorkspaceCreate(userId: string): Promise<string> {
+    const pending = this.pendingWorkspaceCreates.get(userId);
+    if (!pending) {
+      return "No pending workspace directory creation.";
+    }
+    this.pendingWorkspaceCreates.delete(userId);
+    if (!fs.existsSync(pending.cwd)) {
+      fs.mkdirSync(pending.cwd, { recursive: true });
+    }
+    validateDirectory(pending.cwd);
+    return this.startWorkspace({ ...pending, userId });
+  }
+
+  private async startWorkspace(params: { id: string; agent: AgentKind; cwd: string; userId: string }): Promise<string> {
+    const { id, agent, cwd, userId } = params;
+    this.pendingWorkspaceCreates.delete(userId);
+    const preset = AGENT_PRESETS[agent];
+    if (!preset) {
+      return `Unsupported agent: ${agent}. Supported agents: ${Object.keys(AGENT_PRESETS).join(", ")}`;
+    }
 
     const existing = this.running.get(id);
     if (existing) {
@@ -141,6 +193,10 @@ export class WorkspaceManager {
       cwd,
       mcpServers: createSessionMcpServers(this.store.databasePath, userId, id),
       log: this.log,
+      onResumeInfo: (info) => {
+        this.store.updateWorkspaceResumeInfo(id, info);
+        this.log(formatResumeInfo(id, info));
+      },
       onExit: () => {
         this.running.delete(id);
         this.store.updateWorkspaceStatus(id, "exited");
@@ -205,7 +261,8 @@ export class WorkspaceManager {
       .map((record) => {
         const active = record.id === this.activeWorkspaceId ? "*" : " ";
         const runtime = this.running.has(record.id) ? "running" : record.status;
-        return `${active} ${record.id} [${record.agent}] ${runtime} ${record.cwd}`;
+        const resume = record.resumeId ? ` resume=${record.resumeId}` : "";
+        return `${active} ${record.id} [${record.agent}] ${runtime} ${record.cwd}${resume}`;
       })
       .join("\n");
   }
@@ -220,7 +277,12 @@ export class WorkspaceManager {
       return "No active workspace. Use /workspace open or /workspace use first.";
     }
     const runtime = this.running.has(record.id) ? "running" : record.status;
-    return `${record.id} [${record.agent}] ${runtime} ${record.cwd}`;
+    const lines = [`${record.id} [${record.agent}] ${runtime} ${record.cwd}`];
+    if (record.resumeId) {
+      lines.push(`resume id: ${record.resumeId}`);
+      lines.push(`resume command: ${record.resumeCommand ?? defaultResumeCommand(record)}`);
+    }
+    return lines.join("\n");
   }
 
   private async stopWorkspace(id: string | undefined): Promise<string> {
@@ -369,6 +431,10 @@ export class WorkspaceManager {
       cwd: record.cwd,
       mcpServers: createSessionMcpServers(this.store.databasePath, userId, record.id),
       log: this.log,
+      onResumeInfo: (info) => {
+        this.store.updateWorkspaceResumeInfo(record.id, info);
+        this.log(formatResumeInfo(record.id, info));
+      },
       onExit: () => {
         this.running.delete(record.id);
         this.store.updateWorkspaceStatus(record.id, "exited");
@@ -481,6 +547,14 @@ function validateDirectory(cwd: string): void {
 
 function truncate(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.substring(0, maxLength)}...`;
+}
+
+function formatResumeInfo(workspaceId: string, info: AcpResumeInfo): string {
+  return `[workspace:${workspaceId}] captured resume id: ${info.id}${info.command ? ` (${info.command})` : ""}`;
+}
+
+function defaultResumeCommand(record: WorkspaceRecord): string {
+  return record.agent === "copilot" ? `copilot --resume ${record.resumeId}` : `${record.agent} --resume ${record.resumeId}`;
 }
 
 function createSessionMcpServers(databasePath: string, userId: string, workspaceId: string): acp.McpServer[] {

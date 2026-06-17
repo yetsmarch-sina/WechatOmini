@@ -12,7 +12,13 @@ export interface AcpSessionOptions {
   mcpServers?: acp.McpServer[];
   log: Logger;
   onTyping?: () => Promise<void>;
+  onResumeInfo?: (info: AcpResumeInfo) => void;
   onExit?: (code: number | null, signal: NodeJS.Signals | null) => void;
+}
+
+export interface AcpResumeInfo {
+  id: string;
+  command?: string;
 }
 
 export class AcpSession {
@@ -39,7 +45,7 @@ export class AcpSession {
       cwd,
       env: process.env,
       shell: useShell,
-      stdio: ["pipe", "pipe", "inherit"],
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
     this.exited = false;
@@ -61,6 +67,29 @@ export class AcpSession {
       child.kill();
       throw new Error("Failed to open ACP subprocess stdio");
     }
+    let stderrBuffer = "";
+    const handleStderrLine = (line: string) => {
+      const resumeInfo = extractResumeInfo(line);
+      if (resumeInfo) {
+        this.options.onResumeInfo?.(resumeInfo);
+      }
+    };
+    child.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf-8");
+      process.stderr.write(text);
+      stderrBuffer = `${stderrBuffer}${text}`;
+      const lines = stderrBuffer.split(/\r?\n/);
+      stderrBuffer = lines.pop()?.slice(-1_000) ?? "";
+      for (const line of lines) {
+        handleStderrLine(line);
+      }
+    });
+    child.stderr?.on("close", () => {
+      if (stderrBuffer) {
+        handleStderrLine(stderrBuffer);
+        stderrBuffer = "";
+      }
+    });
 
     const client = new AcpClient(log, this.options.onTyping);
     const input = Writable.toWeb(child.stdin);
@@ -137,6 +166,31 @@ export class AcpSession {
       }
     }, 5_000).unref();
   }
+}
+
+function extractResumeInfo(text: string): AcpResumeInfo | undefined {
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = stripAnsi(line).trim();
+    if (!/\bresume\b/i.test(trimmed)) continue;
+    const id = trimmed.match(/--resume(?:=|\s+)([A-Za-z0-9_-]+)/i)?.[1]
+      ?? trimmed.match(/\bresume\s+([A-Za-z0-9][A-Za-z0-9_-]{7,})/i)?.[1];
+    if (id) {
+      return {
+        id,
+        command: extractResumeCommand(trimmed),
+      };
+    }
+  }
+  return undefined;
+}
+
+function stripAnsi(text: string): string {
+  return text.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function extractResumeCommand(line: string): string | undefined {
+  const match = line.match(/(?:^|[`'"])((?:npx\s+)?(?:@github\/)?copilot\b[^`'"]*?\b(?:--)?resume(?:=|\s+)[A-Za-z0-9_-]+[^`'"]*)/i);
+  return match?.[1]?.trim();
 }
 
 function emptyTurnNotice(stopReason: acp.StopReason | undefined): string {

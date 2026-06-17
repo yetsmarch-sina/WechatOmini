@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { getUpdates } from "./api.js";
+import { getUpdates, WeChatApiTimeoutError } from "./api.js";
 import { MessageItemType, MessageType, type WeChatMessage } from "./types.js";
 import type { IncomingMessage } from "../types.js";
 import type { Logger } from "../logger.js";
@@ -42,6 +42,9 @@ export async function startWeChatMonitor(params: {
       }
     } catch (error) {
       if (params.signal.aborted) return;
+      if (error instanceof WeChatApiTimeoutError && error.path === "ilink/bot/getupdates") {
+        continue;
+      }
       params.log(`WeChat monitor error: ${String(error)}`);
       await sleep(2_000, params.signal);
     }

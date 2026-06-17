@@ -123,7 +123,9 @@ MVP 建议先保留少量命令：
 
 | 命令 | 作用 |
 |---|---|
-| `/workspace open <id> <agent> <cwd>` | 在目录下启动 workspace instance |
+| `/workspace open <id> <agent> <cwd> [--create]` | 在目录下启动 workspace instance；目录不存在时默认先确认，带 `--create` 则直接创建 |
+| `/workspace confirm-create` | 确认创建上一次 `/workspace open` 请求中的缺失目录 |
+| `/workspace cancel-create` | 取消待确认的目录创建 |
 | `/workspace use <id>` | 切换 active workspace |
 | `/workspace list` | 列出已知 workspace |
 | `/workspace stop <id>` | 停止某个 workspace |
@@ -135,6 +137,8 @@ MVP 建议先保留少量命令：
 | `/memory remember <text>` | 显式写入长期 memory |
 
 可以暂时不做 `/acp-config`，因为它依赖 agent 的 `configOptions`，不是 MVP 主链路。
+
+Copilot session 退出时如果在 stderr 输出 `--resume <id>` 或 `resume <id>`，manager 会捕获并保存到 workspace 记录中。之后 `/workspace list` 会显示 `resume=<id>`，`/workspace current` 会显示可在 PC terminal 使用的 resume 命令，方便从 WeChat 启动的 session 回到本地 Copilot CLI 继续。
 
 外部能力通过 `pluginmarket` 挂载：manager 默认扫描启动目录上级的 `pluginmarket/*/plugin.json`，也可以用 `WECHAT_ACP_PLUGIN_DIR` 指定插件目录。每个插件可以同时提供：
 

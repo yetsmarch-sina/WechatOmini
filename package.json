@@ -1,6 +1,6 @@
 {
   "name": "wechat-acp-manager",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Minimal WeChat to ACP manager with workspace routing and shared memory",
   "type": "module",
   "files": [

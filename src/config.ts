@@ -113,11 +113,14 @@ Usage:
   wechat-acp-manager --wechat [--login] [--storage-dir <dir>] [--verbose]
 
 MVP commands inside chat/local stdin:
-  /workspace open <id> <copilot|opencode> <cwd>
+  /workspace open <id> <copilot|opencode> <cwd> [--create]
+  /workspace confirm-create
+  /workspace cancel-create
   /workspace use <id>
   /workspace list
   /workspace current
   /workspace stop <id>
+  # /workspace current shows the captured Copilot resume id/command when available.
   /memory remember <text>
   /memory search [--all] <query>
   /memory topics [--all]
