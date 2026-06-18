@@ -209,7 +209,7 @@ function requireValue(args: string[], index: number, option: string): string {
 
 function defaultFileConfig(): FileConfig {
   return {
-    pluginMode: "managed",
+    pluginMode: "copilot-native",
     pluginMarketDirs: [path.resolve(process.cwd(), "..", "pluginmarket")],
     copilot: {
       extraArgs: ["--enable-all-github-mcp-tools"],

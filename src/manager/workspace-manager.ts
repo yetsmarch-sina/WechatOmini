@@ -30,6 +30,14 @@ interface PluginSkill {
   content: string;
 }
 
+interface NativeMcpConfig {
+  mcpServers: Record<string, {
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+  }>;
+}
+
 interface PendingWorkspaceCreate {
   id: string;
   agent: AgentKind;
@@ -188,9 +196,10 @@ export class WorkspaceManager {
       this.running.delete(id);
     }
 
+    const workspacePreset = this.preparePresetForWorkspace(preset, userId, id);
     const session = new AcpSession({
       workspaceId: id,
-      preset,
+      preset: workspacePreset,
       cwd,
       mcpServers: this.createSessionMcpServers(userId, id),
       log: this.log,
@@ -223,10 +232,10 @@ export class WorkspaceManager {
       status: "running",
       pid: session.pid,
     });
-    this.running.set(id, { record, preset, session });
+    this.running.set(id, { record, preset: workspacePreset, session });
     this.activeWorkspaceId = id;
 
-    return `Workspace '${id}' is running with ${preset.label} at ${cwd}. It is now active.`;
+    return `Workspace '${id}' is running with ${workspacePreset.label} at ${cwd}. It is now active.`;
   }
 
   private async useWorkspace(id: string | undefined, userId: string): Promise<string> {
@@ -426,9 +435,10 @@ export class WorkspaceManager {
 
   private async startFromRecord(record: WorkspaceRecord, preset: AgentPreset, userId: string): Promise<RunningWorkspace> {
     validateDirectory(record.cwd);
+    const workspacePreset = this.preparePresetForWorkspace(preset, userId, record.id);
     const session = new AcpSession({
       workspaceId: record.id,
-      preset,
+      preset: workspacePreset,
       cwd: record.cwd,
       mcpServers: this.createSessionMcpServers(userId, record.id),
       log: this.log,
@@ -449,7 +459,7 @@ export class WorkspaceManager {
       status: "running",
       pid: session.pid,
     });
-    const running = { record: updated, preset, session };
+    const running = { record: updated, preset: workspacePreset, session };
     this.running.set(record.id, running);
     return running;
   }
@@ -466,15 +476,54 @@ export class WorkspaceManager {
     return buildAgentPreset(agent, this.config);
   }
 
+  private preparePresetForWorkspace(preset: AgentPreset, userId: string, workspaceId: string): AgentPreset {
+    if (preset.kind !== "copilot" || this.config.plugins.mode !== "copilot-native") {
+      return preset;
+    }
+    const configPath = this.writeNativeMcpConfig(userId, workspaceId);
+    return {
+      ...preset,
+      args: [...preset.args, "--additional-mcp-config", `@${configPath}`],
+    };
+  }
+
+  private writeNativeMcpConfig(userId: string, workspaceId: string): string {
+    const env = this.sessionPluginEnv(userId, workspaceId);
+    const config: NativeMcpConfig = { mcpServers: {} };
+    for (const pluginDir of listPluginDirs(this.config.plugins.marketDirs)) {
+      const manifest = readPluginManifest(path.join(pluginDir, "plugin.json"));
+      if (!manifest) continue;
+      config.mcpServers[manifest.name] = {
+        command: manifest.command,
+        args: resolvePluginArgs(pluginDir, manifest.args ?? []),
+        env: {
+          ...env,
+          ...Object.fromEntries(resolvePluginEnv(manifest.env ?? [], env).map((item) => [item.name, item.value])),
+        },
+      };
+    }
+    const dir = path.join(this.config.storageDir, "native-mcp");
+    fs.mkdirSync(dir, { recursive: true });
+    const configPath = path.join(dir, `${workspaceId}.json`);
+    fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
+    return configPath;
+  }
+
   private createSessionMcpServers(userId: string, workspaceId: string): acp.McpServer[] {
     if (this.config.plugins.mode === "copilot-native") {
       return [];
     }
-    return loadPluginMcpServers(this.config.plugins.marketDirs, {
+    return loadPluginMcpServers(this.config.plugins.marketDirs, this.sessionPluginEnv(userId, workspaceId));
+  }
+
+  private sessionPluginEnv(userId: string, workspaceId: string): Record<string, string> {
+    return {
       WECHAT_ACP_MEMORY_DB: this.store.databasePath,
       WECHAT_ACP_USER_ID: userId,
       WECHAT_ACP_WORKSPACE_ID: workspaceId,
-    });
+      WECHAT_ACP_STORAGE_DIR: this.config.storageDir,
+      SKILLOPT_PLUGIN_MARKET_DIRS: this.config.plugins.marketDirs.join(path.delimiter),
+    };
   }
 }
 
