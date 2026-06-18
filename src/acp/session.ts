@@ -118,6 +118,10 @@ export class AcpSession {
       mcpServers: this.options.mcpServers ?? [],
     });
     log(`[workspace:${this.options.workspaceId}] ACP session created: ${newSessionResult.sessionId}`);
+    this.options.onResumeInfo?.({
+      id: newSessionResult.sessionId,
+      command: `${preset.command} ${preset.args.filter((arg) => arg !== "--acp").join(" ")} --resume=${newSessionResult.sessionId}`,
+    });
 
     this.process = child;
     this.client = client;
