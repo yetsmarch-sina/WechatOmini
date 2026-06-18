@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
-import { AGENT_PRESETS, type AgentPreset } from "../config.js";
+import { buildAgentPreset, listPluginDirs, supportedAgents, type AgentPreset, type AppConfig } from "../config.js";
 import { AcpSession, type AcpResumeInfo } from "../acp/session.js";
 import type { Logger } from "../logger.js";
 import type { MemoryStore, ContextBundle, WorkspaceRecord } from "../memory/store.js";
@@ -46,6 +46,7 @@ export class WorkspaceManager {
     private readonly store: MemoryStore,
     private readonly transport: MessageTransport,
     private readonly log: Logger,
+    private readonly config: AppConfig,
   ) {}
 
   async handleIncoming(message: IncomingMessage): Promise<void> {
@@ -137,9 +138,9 @@ export class WorkspaceManager {
     }
     validateWorkspaceId(id);
 
-    const preset = AGENT_PRESETS[agent];
+    const preset = this.getAgentPreset(agent);
     if (!preset) {
-      return `Unsupported agent: ${agent}. Supported agents: ${Object.keys(AGENT_PRESETS).join(", ")}`;
+      return `Unsupported agent: ${agent}. Supported agents: ${supportedAgents().join(", ")}`;
     }
 
     const cwd = path.resolve(cwdText);
@@ -176,9 +177,9 @@ export class WorkspaceManager {
   private async startWorkspace(params: { id: string; agent: AgentKind; cwd: string; userId: string }): Promise<string> {
     const { id, agent, cwd, userId } = params;
     this.pendingWorkspaceCreates.delete(userId);
-    const preset = AGENT_PRESETS[agent];
+    const preset = this.getAgentPreset(agent);
     if (!preset) {
-      return `Unsupported agent: ${agent}. Supported agents: ${Object.keys(AGENT_PRESETS).join(", ")}`;
+      return `Unsupported agent: ${agent}. Supported agents: ${supportedAgents().join(", ")}`;
     }
 
     const existing = this.running.get(id);
@@ -191,7 +192,7 @@ export class WorkspaceManager {
       workspaceId: id,
       preset,
       cwd,
-      mcpServers: createSessionMcpServers(this.store.databasePath, userId, id),
+      mcpServers: this.createSessionMcpServers(userId, id),
       log: this.log,
       onResumeInfo: (info) => {
         this.store.updateWorkspaceResumeInfo(id, info);
@@ -239,7 +240,7 @@ export class WorkspaceManager {
       if (!record) {
         return `Workspace '${id}' does not exist. Use /workspace open <id> <agent> <cwd> first.`;
       }
-      const preset = AGENT_PRESETS[record.agent as AgentKind];
+      const preset = this.getAgentPreset(record.agent as AgentKind);
       if (!preset) {
         return `Workspace '${id}' uses unsupported agent '${record.agent}'.`;
       }
@@ -398,7 +399,7 @@ export class WorkspaceManager {
       includeAllWorkspaces: true,
     });
     const recentTurns = this.store.getRecentTurns(active.record.id, message.userId, 8);
-    const prompt = buildPrompt(message.text, context, recentTurns);
+    const prompt = buildPrompt(message.text, context, recentTurns, this.config);
 
     await this.transport.sendTyping?.(target);
     const result = await active.session.prompt(prompt);
@@ -429,7 +430,7 @@ export class WorkspaceManager {
       workspaceId: record.id,
       preset,
       cwd: record.cwd,
-      mcpServers: createSessionMcpServers(this.store.databasePath, userId, record.id),
+      mcpServers: this.createSessionMcpServers(userId, record.id),
       log: this.log,
       onResumeInfo: (info) => {
         this.store.updateWorkspaceResumeInfo(record.id, info);
@@ -460,12 +461,28 @@ export class WorkspaceManager {
       .join("\n");
     this.store.setSessionSummary(workspaceId, summary);
   }
+
+  private getAgentPreset(agent: AgentKind): AgentPreset | undefined {
+    return buildAgentPreset(agent, this.config);
+  }
+
+  private createSessionMcpServers(userId: string, workspaceId: string): acp.McpServer[] {
+    if (this.config.plugins.mode === "copilot-native") {
+      return [];
+    }
+    return loadPluginMcpServers(this.config.plugins.marketDirs, {
+      WECHAT_ACP_MEMORY_DB: this.store.databasePath,
+      WECHAT_ACP_USER_ID: userId,
+      WECHAT_ACP_WORKSPACE_ID: workspaceId,
+    });
+  }
 }
 
 function buildPrompt(
   userMessage: string,
   context: ContextBundle,
   recentTurns: Array<{ role: string; content: string }>,
+  config: AppConfig,
 ): string {
   const sections: string[] = [];
 
@@ -484,7 +501,7 @@ function buildPrompt(
     sections.push(`[Session Summary]\n${context.sessionSummary.trim()}`);
   }
 
-  const pluginSkills = loadPluginSkills();
+  const pluginSkills = config.plugins.mode === "managed" ? loadPluginSkills(config.plugins.marketDirs) : [];
   if (pluginSkills.length > 0) {
     sections.push(
       `[Plugin Skills]\n${pluginSkills
@@ -557,27 +574,10 @@ function defaultResumeCommand(record: WorkspaceRecord): string {
   return record.agent === "copilot" ? `copilot --resume ${record.resumeId}` : `${record.agent} --resume ${record.resumeId}`;
 }
 
-function createSessionMcpServers(databasePath: string, userId: string, workspaceId: string): acp.McpServer[] {
-  return loadPluginMcpServers({
-    WECHAT_ACP_MEMORY_DB: databasePath,
-    WECHAT_ACP_USER_ID: userId,
-    WECHAT_ACP_WORKSPACE_ID: workspaceId,
-  });
-}
-
-function loadPluginMcpServers(sessionEnv: Record<string, string>): acp.McpServer[] {
-  const pluginRoot = path.resolve(process.env.WECHAT_ACP_PLUGIN_DIR ?? path.join(process.cwd(), "..", "pluginmarket"));
-  if (!fs.existsSync(pluginRoot) || !fs.statSync(pluginRoot).isDirectory()) {
-    return [];
-  }
-
+function loadPluginMcpServers(pluginRoots: string[], sessionEnv: Record<string, string>): acp.McpServer[] {
   const servers: acp.McpServer[] = [];
-  for (const entry of fs.readdirSync(pluginRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const pluginDir = path.join(pluginRoot, entry.name);
+  for (const pluginDir of listPluginDirs(pluginRoots)) {
     const manifestPath = path.join(pluginDir, "plugin.json");
-    if (!fs.existsSync(manifestPath)) continue;
-
     const manifest = readPluginManifest(manifestPath);
     if (!manifest) continue;
     servers.push({
@@ -631,18 +631,10 @@ function resolvePluginEnv(
   }));
 }
 
-function loadPluginSkills(): PluginSkill[] {
-  const pluginRoot = path.resolve(process.env.WECHAT_ACP_PLUGIN_DIR ?? path.join(process.cwd(), "..", "pluginmarket"));
-  if (!fs.existsSync(pluginRoot) || !fs.statSync(pluginRoot).isDirectory()) {
-    return [];
-  }
-
+function loadPluginSkills(pluginRoots: string[]): PluginSkill[] {
   const skills: PluginSkill[] = [];
-  for (const entry of fs.readdirSync(pluginRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const pluginDir = path.join(pluginRoot, entry.name);
+  for (const pluginDir of listPluginDirs(pluginRoots)) {
     const manifestPath = path.join(pluginDir, "plugin.json");
-    if (!fs.existsSync(manifestPath)) continue;
     const manifest = readPluginManifest(manifestPath);
     if (!manifest) continue;
     const skillPath = resolvePluginSkillPath(pluginDir, manifest.skill ?? "SKILL.md");

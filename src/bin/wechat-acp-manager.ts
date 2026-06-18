@@ -57,7 +57,7 @@ async function main(): Promise<void> {
         : loadToken(config.storageDir)!;
 
     const transport = new WeChatTransport(token);
-    manager = new WorkspaceManager(store, transport, log);
+    manager = new WorkspaceManager(store, transport, log, config);
     log("WeChat mode started. Send /help to the bot for commands.");
     await startWeChatMonitor({
       baseUrl: token.baseUrl,
@@ -71,7 +71,7 @@ async function main(): Promise<void> {
   }
 
   const transport = new LocalTransport();
-  manager = new WorkspaceManager(store, transport, log);
+  manager = new WorkspaceManager(store, transport, log, config);
   await startLocalInput(manager, config.defaultUserId);
 }
 
